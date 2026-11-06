@@ -21,7 +21,7 @@
 #   --jobs N                 AWG_JOBS N    4
 #
 # Result: fpga/awg_multichannel_rfsoc/   (git-ignored Vivado project)
-#         fpga/bitstreams/awg_adc_v4.bit + .hwh   (ADC 4.9152 GSps raw, locked to AWG ch0; awg_only_new.* with --no-adc)
+#         fpga/bitstreams/awg_adc_v5.bit + .hwh   (2 ADC channels, ADC D + vin0_23, 4.9152 GSps raw, locked to AWG ch0; awg_only_new.* with --no-adc)
 #         A full build takes roughly 50 minutes.
 # =============================================================================
 
@@ -152,7 +152,7 @@ if {($awg_wns ne "" && $awg_wns < 0) || ($awg_whs ne "" && $awg_whs < 0)} {
 }
 
 # ------------------------------------------------------------ copy bit + hwh next to the others
-set awg_name [expr {$awg_opt(adc) ? "awg_adc_v4" : "awg_only_new"}]
+set awg_name [expr {$awg_opt(adc) ? "awg_adc_v5" : "awg_only_new"}]
 set awg_out  [file join $awg_fpga_dir bitstreams]
 file mkdir $awg_out
 set awg_bit [file join $awg_run_dir ${awg_bd}_wrapper.bit]

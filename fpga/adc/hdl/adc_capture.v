@@ -2,13 +2,17 @@
 // ============================================================================
 // adc_capture.v  -  triggered capture of the raw ADC stream, locked to the AWG
 //
-//  * Input : RFDC ADC slice 00 (vin0_01), real output, no decimation: 4.9152 GSps,
-//            12 x int16 per beat (192 bit), sample 0 (earliest) in [15:0].
+//  * Input : TWO RFDC ADC slices of tile 224, captured together, sample-aligned:
+//              ch0 = slice 00 (vin0_01, ADC D)  -> s_axis
+//              ch1 = slice 02 (vin0_23)         -> s1_axis
+//            each real output, no decimation: 4.9152 GSps, 12 x int16 per beat (192 bit),
+//            sample 0 (earliest) in [15:0]. Both slices share the tile and the stream clock.
 //            ADC stream clock 409.6 MHz, made by an MMCM (clk_wiz_adc) from the DAC0 clock (614.4 MHz).
 //            The stream is never back-pressured.
 //  * Memory: every beat goes straight into a true-dual-port BRAM (port A, ADC clock),
-//            one 256-bit word per beat (12 samples + 64 zero bits). The PS reads it through an
-//            AXI BRAM controller on port B. 16384 beats = 196608 samples = 40.0 us.
+//            one 512-bit word per beat: ch0 in bits [191:0], ch1 in bits [447:256] (rest zero).
+//            The PS reads it through an AXI BRAM controller on port B.
+//            16384 beats = 196608 samples per channel = 40.0 us.
 //  * Ring buffer with pre-trigger: after ARM, PRE beats are filled, then the engine waits for the
 //    trigger, writes POST beats from the trigger beat on, and stops (DONE).
 //    The valid window is beats [TADDR-PRE, TADDR+POST-1] (modulo DEPTH).
@@ -21,6 +25,7 @@
 //        software calibrates with a loopback cable)
 //      7 manual only (FORCE bit)
 //    Level triggers are sample accurate: TSUB gives the sample inside the trigger beat.
+//    MODE bit 3 selects the channel the level trigger looks at (0 = ch0, 1 = ch1).
 //  * AWG lock: the AWG ch0 event crosses   AWG 614.4 MHz -> frame 204.8 MHz -> ADC 409.6 MHz
 //    through plain registers (synchronous, timed by Vivado: all three clocks come from the DAC0
 //    clock), together with its position in the frame.
@@ -29,7 +34,7 @@
 //
 // Register map (AXI4-Lite, byte offsets)
 //   0x00 CTRL    W  bit0 ARM, bit1 FORCE, bit2 ABORT (write 1, self-clearing)
-//   0x04 MODE    RW [2:0] trigger source
+//   0x04 MODE    RW [2:0] trigger source, [3] level-trigger channel (0 = ch0, 1 = ch1)
 //   0x08 LEVEL   RW [15:0] signed threshold (int16 ADC code)
 //   0x0C PRE     RW beats before the trigger beat (0 .. DEPTH-1)
 //   0x10 POST    RW beats from the trigger beat on (1 .. DEPTH-PRE)
@@ -38,9 +43,10 @@
 //   0x1C TSUB    R  [3:0] sample index (0..11) of the trigger inside the beat (level and AWG ch0)
 //   0x20 TTIME   R  ADC clock cycles from ARM to trigger
 //   0x24 DEPTH   R  buffer depth in beats
-//   0x28 ID      R  0xADC5_0004
+//   0x28 ID      R  0xADC5_0005
 //   0x2C ALIVE   R  free-running count of valid ADC beats (shows the ADC is streaming)
-//   0x30 CFG     R  [7:0] samples per beat (12), [15:8] 32-bit words per memory word (8), [16] AWG ch0 locked (1)
+//   0x30 CFG     R  [7:0] samples per beat (12), [15:8] 32-bit words per memory word (16), [16] AWG ch0 locked (1),
+//                   [27:24] number of channels (2), channel c starts at 32-bit word 8*c of each memory word
 //   0x34 FS_KHZ  R  sample rate in kHz (4915200)
 //   0x38 CLKCTL  RW bit0 MMCM reset (write 1 then 0 once the DAC clock runs)
 // ============================================================================
@@ -74,30 +80,33 @@ module adc_capture #(
     input  wire         s_axi_rready,
 
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 adc_clk CLK" *)
-    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF s_axis, ASSOCIATED_RESET adc_aresetn" *)
+    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF s_axis:s1_axis, ASSOCIATED_RESET adc_aresetn" *)
     input  wire         adc_clk,        // 409.6 MHz, MMCM clk_out1 (from the DAC0 clock)
     (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 adc_aresetn RST" *)
     (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
     input  wire         adc_aresetn,
-    input  wire [191:0] s_axis_tdata,   // 12 x int16, sample 0 (earliest) in [15:0]
+    input  wire [191:0] s_axis_tdata,   // ch0: 12 x int16, sample 0 (earliest) in [15:0]
     input  wire         s_axis_tvalid,
     output wire         s_axis_tready,
+    input  wire [191:0] s1_axis_tdata,  // ch1: same format, same tile, same clock
+    input  wire         s1_axis_tvalid,
+    output wire         s1_axis_tready,
 
     (* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 BRAM_PORTA CLK" *)
-    (* X_INTERFACE_PARAMETER = "MASTER_TYPE BRAM_CTRL, MEM_ECC NONE, MEM_WIDTH 256, MEM_SIZE 524288, READ_WRITE_MODE WRITE_ONLY" *)
+    (* X_INTERFACE_PARAMETER = "MASTER_TYPE BRAM_CTRL, MEM_ECC NONE, MEM_WIDTH 512, MEM_SIZE 1048576, READ_WRITE_MODE WRITE_ONLY" *)
     output wire         bram_clk,
     (* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 BRAM_PORTA RST" *)
     output wire         bram_rst,
     (* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 BRAM_PORTA EN" *)
     output wire         bram_en,
     (* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 BRAM_PORTA WE" *)
-    output wire [31:0]  bram_we,
+    output wire [63:0]  bram_we,
     (* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 BRAM_PORTA ADDR" *)
     output wire [31:0]  bram_addr,
     (* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 BRAM_PORTA DIN" *)
-    output wire [255:0] bram_din,
+    output wire [511:0] bram_din,
     (* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 BRAM_PORTA DOUT" *)
-    input  wire [255:0] bram_dout,
+    input  wire [511:0] bram_dout,
 
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 clk_awg CLK" *)
     input  wire         clk_awg,        // 614.4 MHz AWG ch0 clock (util_ds_buf_0/BUFG_O)
@@ -113,22 +122,23 @@ module adc_capture #(
     input  wire         ctrl_trig
 );
     localparam NS    = 12;                           // samples per beat
-    localparam MEM_W = 256;                          // memory word: 12 samples + 64 unused bits
+    localparam NCH   = 2;                            // channels
+    localparam MEM_W = 512;                          // memory word: 2 x (12 samples + 64 unused bits)
     localparam [31:0] FS_KHZ = 32'd4915200;
     localparam BW    = 16 * NS;
     localparam MB    = $clog2(MEM_W / 8);            // byte-address bits per memory word
     localparam DEPTH = 1 << DEPTH_LOG2;
     localparam PW    = DEPTH_LOG2 + 1;               // width of PRE / POST / counters
-    localparam [31:0] CORE_ID = 32'hADC5_0004;
+    localparam [31:0] CORE_ID = 32'hADC5_0005;
     localparam integer WPW = MEM_W / 32;             // 32-bit words per memory word
-    localparam [31:0] CFG_WORD = 32'h0001_0000 | (WPW << 8) | NS;   // bit 16: AWG ch0 locked
+    localparam [31:0] CFG_WORD = (NCH << 24) | 32'h0001_0000 | (WPW << 8) | NS;   // bit 16: AWG ch0 locked
 
     localparam [2:0] S_IDLE = 3'd0, S_FILL = 3'd1, S_ARMED = 3'd2, S_POST = 3'd3, S_DONE = 3'd4;
 
     // =====================================================================
     // PS clock domain: AXI4-Lite registers
     // =====================================================================
-    reg  [2:0]  r_mode  = 3'd1;
+    reg  [3:0]  r_mode  = 4'd1;
     reg  [15:0] r_level = 16'd3277;               // ~0.1 of full scale
     reg  [PW-1:0] r_pre  = DEPTH / 4;
     reg  [PW-1:0] r_post = DEPTH / 2;
@@ -172,7 +182,7 @@ module adc_capture #(
                         if (s_axi_wdata[1]) force_tog_ps <= ~force_tog_ps;
                         if (s_axi_wdata[2]) abort_tog_ps <= ~abort_tog_ps;
                     end
-                    5'h01: r_mode  <= s_axi_wdata[2:0];
+                    5'h01: r_mode  <= s_axi_wdata[3:0];
                     5'h02: r_level <= s_axi_wdata[15:0];
                     5'h03: r_pre   <= s_axi_wdata[PW-1:0];
                     5'h04: r_post  <= s_axi_wdata[PW-1:0];
@@ -186,7 +196,7 @@ module adc_capture #(
             if (s_axi_arready) begin
                 s_axi_rvalid <= 1'b1;
                 case (s_axi_araddr[6:2])
-                    5'h01: s_axi_rdata <= {29'd0, r_mode};
+                    5'h01: s_axi_rdata <= {28'd0, r_mode};
                     5'h02: s_axi_rdata <= {16'd0, r_level};
                     5'h03: s_axi_rdata <= {{(32-PW){1'b0}}, r_pre};
                     5'h04: s_axi_rdata <= {{(32-PW){1'b0}}, r_post};
@@ -211,13 +221,13 @@ module adc_capture #(
     // =====================================================================
     // CDC  PS -> ADC
     // =====================================================================
-    localparam CFGW = 3 + 16 + PW + PW;
+    localparam CFGW = 4 + 16 + PW + PW;
     wire [CFGW-1:0] cfg_adc;
     xpm_cdc_array_single #(.DEST_SYNC_FF(2), .INIT_SYNC_FF(0), .SIM_ASSERT_CHK(0),
                            .SRC_INPUT_REG(1), .WIDTH(CFGW))
         u_cdc_cfg (.src_clk(s_axi_aclk), .src_in({r_mode, r_level, r_pre, r_post}),
                    .dest_clk(adc_clk), .dest_out(cfg_adc));
-    wire [2:0]    mode_a  = cfg_adc[CFGW-1 -: 3];
+    wire [3:0]    mode_a  = cfg_adc[CFGW-1 -: 4];
     wire [15:0]   level_a = cfg_adc[2*PW +: 16];
     wire [PW-1:0] pre_a   = cfg_adc[PW +: PW];
     wire [PW-1:0] post_a  = cfg_adc[0 +: PW];
@@ -239,7 +249,8 @@ module adc_capture #(
     // =====================================================================
     // ADC clock domain
     // =====================================================================
-    assign s_axis_tready = 1'b1;     // never back-pressure the RFDC
+    assign s_axis_tready  = 1'b1;    // never back-pressure the RFDC
+    assign s1_axis_tready = 1'b1;
 
     reg arm_d = 1'b0, force_d = 1'b0, abort_d = 1'b0;
     reg seq2_d = 1'b0, ctrl_d = 1'b0;
@@ -259,7 +270,10 @@ module adc_capture #(
     // st1: compare each sample with LEVEL    (d1, ge1)
     // st2: find crossings                    (d2, rise2, fall2)
     // st3: trigger decision + BRAM write of d2
-    reg [BW-1:0] d0, d1, d2;
+    reg [BW-1:0] d0, d1, d2;          // ch0
+    reg [BW-1:0] e0, e1d, e2d;        // ch1 (same pipeline)
+    reg [BW-1:0] t0;                  // channel the level trigger looks at
+    reg          tch = 1'b0;          // level-trigger channel (from MODE[3])
     reg          v0 = 1'b0, v1 = 1'b0, v2 = 1'b0;
     reg [NS-1:0] ge1, rise2, fall2;
     reg          ge_last = 1'b0;
@@ -268,11 +282,13 @@ module adc_capture #(
     integer i;
     always @(posedge adc_clk) begin
         level_r <= level_a;
-        d0 <= s_axis_tdata;  v0 <= s_axis_tvalid;
-        d1 <= d0;            v1 <= v0;
+        tch   <= mode_a[3];
+        d0 <= s_axis_tdata;  e0 <= s1_axis_tdata;  v0 <= s_axis_tvalid;
+        t0 <= tch ? s1_axis_tdata : s_axis_tdata;
+        d1 <= d0;            e1d <= e0;            v1 <= v0;
         for (i = 0; i < NS; i = i + 1)
-            ge1[i] <= ($signed(d0[16*i +: 16]) >= $signed(level_r));
-        d2 <= d1;            v2 <= v1;
+            ge1[i] <= ($signed(t0[16*i +: 16]) >= $signed(level_r));
+        d2 <= d1;            e2d <= e1d;           v2 <= v1;
         if (v1) begin
             rise2[0] <=  ge1[0] & ~ge_last;
             fall2[0] <= ~ge1[0] &  ge_last;
@@ -439,7 +455,7 @@ module adc_capture #(
             pre_m1  <= pre_a - 1'b1;
             post_l  <= (post_a == {PW{1'b0}}) ? {{(PW-1){1'b0}}, 1'b1} : post_a;
             post_m1 <= (post_a == {PW{1'b0}}) ? {PW{1'b0}} : post_a - 1'b1;
-            mode_l  <= mode_a;
+            mode_l  <= mode_a[2:0];
             cnt     <= {PW{1'b0}};
             wcnt    <= {PW{1'b0}};
             tcnt    <= 32'd0;
@@ -504,7 +520,7 @@ module adc_capture #(
     assign bram_en   = writing;
     assign bram_we   = {(MEM_W/8){writing}};
     assign bram_addr = {{(32-DEPTH_LOG2-MB){1'b0}}, wptr, {MB{1'b0}}};
-    assign bram_din  = {{(MEM_W-BW){1'b0}}, d2};
+    assign bram_din  = {{(MEM_W/2-BW){1'b0}}, e2d, {(MEM_W/2-BW){1'b0}}, d2};   // ch1 | ch0
 
     // =====================================================================
     // CDC  ADC -> PS

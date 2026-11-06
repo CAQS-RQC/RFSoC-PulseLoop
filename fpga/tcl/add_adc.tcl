@@ -1,12 +1,14 @@
-# add_adc.tcl  (v4)  -  triggered ADC capture for the AWG block design
+# add_adc.tcl  (v5)  -  triggered 2-channel ADC capture for the AWG block design
 #
 # Replaces the v2 DMA capture (packet_generator / clock converter / FIFO / axi_dma) by:
 #
-#   RFDC m00_axis (slice 00 = vin0_01): real, no decimation -> 4.9152 GSps, 12 samples/beat (192 bit)
+#   RFDC m00_axis (slice 00 = vin0_01, ADC D) -> adc/s_axis   (ch0)
+#   RFDC m02_axis (slice 02 = vin0_23)        -> adc/s1_axis  (ch1)   same tile 224, same clock
+#        each: real, no decimation -> 4.9152 GSps, 12 samples/beat (192 bit)
 #        | 409.6 MHz from clk_wiz_adc (MMCM fed by the DAC0 614.4 MHz clock -> ADC beats locked to AWG ch0)
 #   adc      (adc/hdl/adc_capture.v : trigger engine + AXI-Lite registers)
 #        | BRAM port A, ADC clock (never back-pressures the ADC, never loses a sample)
-#   blk_mem_adc  (true dual-port BRAM, 16384 x 256 bit = 196608 samples = 40 us)
+#   blk_mem_adc  (true dual-port BRAM, 16384 x 512 bit = 2 x 196608 samples = 40 us per channel)
 #        | BRAM port B, PS clock
 #   axi_bram_ctrl_adc  <- ps8_0_axi_periph/M08   (PS reads the samples)
 #   adc/s_axi      <- ps8_0_axi_periph/M09   (PS reads/writes the registers)
@@ -21,8 +23,8 @@
 # Log: fpga/tcl/add_adc.log
 
 if {![info exists DO_BUILD]} { set DO_BUILD 1 }   ;# 1 = after a clean validation, regenerate and launch synth+impl+bitstream (the master script sets 0)
-set DEPTH_LOG2 14         ;# must match DEPTH_LOG2 / MEM_SIZE in adc_capture.v (32 << 14 = 512 KiB)
-set MEM_W      256
+set DEPTH_LOG2 14         ;# must match DEPTH_LOG2 / MEM_SIZE in adc_capture.v (64 << 14 = 1 MiB)
+set MEM_W      512
 set MEM_BYTES  [expr {($MEM_W / 8) << $DEPTH_LOG2}]
 
 set script_dir [file dirname [file normalize [info script]]]
@@ -65,7 +67,8 @@ proc ihook {a b} {
 }
 
 set rfdc_name usp_rf_data_converter_0
-set S 00 ; set t 0          ;# ADC slice 00 = tile 224 block 0 (vin0_01)
+set S 00 ; set t 0          ;# ch0: ADC slice 00 = tile 224 block 0 (vin0_01, ADC D)
+set S1 02                   ;# ch1: ADC slice 02 = tile 224 block 2 (vin0_23), same tile -> same clock
 
 # ------------------------------------------------------------ STEP 0: checks
 current_bd_design
@@ -95,13 +98,17 @@ proc cfg_ok {rfdc wantv} {
 # 409.6 MHz (it only offers 38.4/76.8/153.6/307.2), so the stream clock comes from clk_wiz_adc.
 set common [list \
     CONFIG.ADC_Slice${S}_Enable  true \
+    CONFIG.ADC_Slice${S1}_Enable true \
     CONFIG.ADC${t}_Sampling_Rate 4.9152 \
     CONFIG.ADC${t}_PLL_Enable    true \
     CONFIG.ADC${t}_Refclk_Freq   491.520]
 set want_bytes 24
 # order matters inside one set_property -dict: type and decimation first, then the values they unlock
-set real1 [list CONFIG.ADC_Data_Type${S} 0 CONFIG.ADC_Decimation_Mode${S} 1 CONFIG.ADC_Mixer_Type${S} 1 \
-                CONFIG.ADC_Data_Width${S} 12]
+set real1 {}
+foreach sl [list $S $S1] {
+    lappend real1 CONFIG.ADC_Data_Type${sl} 0 CONFIG.ADC_Decimation_Mode${sl} 1 CONFIG.ADC_Mixer_Type${sl} 1 \
+                  CONFIG.ADC_Data_Width${sl} 12
+}
 set candidates [list \
     [concat $common $real1 [list CONFIG.ADC${t}_Outclk_Freq 307.200]] \
     [concat $common $real1]]
@@ -134,8 +141,10 @@ foreach cand $candidates {
     }
     set bad [cfg_ok $rfdc $cand]
     set nb  [get_property CONFIG.TDATA_NUM_BYTES [get_bd_intf_pins $rfdc_name/m${S}_axis]]
-    if {[llength $bad] == 0 && $nb == $want_bytes} { set applied 1 ; break }
-    set last_err "readback: $bad  m${S}_axis bytes=$nb (want $want_bytes)"
+    set nb1 -1
+    catch {set nb1 [get_property CONFIG.TDATA_NUM_BYTES [get_bd_intf_pins $rfdc_name/m${S1}_axis]]}
+    if {[llength $bad] == 0 && $nb == $want_bytes && $nb1 == $want_bytes} { set applied 1 ; break }
+    set last_err "readback: $bad  m${S}_axis bytes=$nb m${S1}_axis bytes=$nb1 (want $want_bytes)"
     say "INFO: candidate not usable: $last_err"
 }
 if {!$applied} { die "RFDC ADC config failed: $last_err (see the DIAG lines in fpga/tcl/add_adc.log)" }
@@ -145,7 +154,7 @@ foreach k [list CONFIG.ADC${t}_Fabric_Freq CONFIG.ADC_Mixer_Type${S} CONFIG.ADC_
 if {![catch {get_property CONFIG.ADC${t}_Fabric_Freq $rfdc} ff] && [string is double -strict $ff] && abs($ff - 409.6) > 0.01} {
     die "RFDC wants an ADC stream clock of $ff MHz, this design makes 409.6 MHz"
 }
-say "INFO: ADC config ok (real, no decimation -> 4.9152 GSps, 12 samples/beat)"
+say "INFO: ADC config ok: slices $S and $S1 (real, no decimation -> 4.9152 GSps, 12 samples/beat each)"
 
 # ------------------------------------------------------------ STEP 2: remove v2 / previous v3 cells
 say "STEP 2: cleanup"
@@ -213,6 +222,13 @@ if {[llength [get_bd_intf_ports -quiet vin0_01_1]] == 0} {
 if {[llength [get_bd_intf_nets -quiet -of_objects [get_bd_intf_pins $rfdc_name/vin0_01]]] == 0} {
     connect_bd_intf_net [get_bd_intf_ports vin0_01_1] [get_bd_intf_pins $rfdc_name/vin0_01]
 }
+# ch1 analog input (slice 02)
+if {[llength [get_bd_intf_ports -quiet vin0_23_1]] == 0} {
+    create_bd_intf_port -mode Slave -vlnv xilinx.com:interface:diff_analog_io_rtl:1.0 vin0_23_1
+}
+if {[llength [get_bd_intf_nets -quiet -of_objects [get_bd_intf_pins $rfdc_name/vin0_23]]] == 0} {
+    connect_bd_intf_net [get_bd_intf_ports vin0_23_1] [get_bd_intf_pins $rfdc_name/vin0_23]
+}
 
 # ------------------------------------------------------------ STEP 5: cells
 say "STEP 5: ADC capture cells"
@@ -249,6 +265,7 @@ if {[catch {set_property -dict [list CONFIG.use_bram_block BRAM_Controller CONFI
 # ------------------------------------------------------------ STEP 6: connections
 say "STEP 6: connections"
 ihook $rfdc_name/m${S}_axis             adc/s_axis
+ihook $rfdc_name/m${S1}_axis            adc/s1_axis
 ihook adc/BRAM_PORTA              blk_mem_adc/BRAM_PORTA
 ihook axi_bram_ctrl_adc/BRAM_PORTA    blk_mem_adc/BRAM_PORTB
 ihook ps8_0_axi_periph/M08_AXI          axi_bram_ctrl_adc/S_AXI

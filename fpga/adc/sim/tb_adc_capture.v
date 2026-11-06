@@ -14,12 +14,17 @@ module tb;
 
     // ---------------- ADC stream ----------------
     integer off = 0;                      // sample(n) = n - off  (16-bit)
-    reg [191:0] tdata = 0;
+    // ch1 carries the same ramp shifted by D1 samples: ch1(n) = ch0(n) + D1
+    localparam integer D1 = 7;
+    reg [191:0] tdata = 0, tdata1 = 0;
     integer k;
     always @(posedge adc) begin : gen
-        reg [191:0] t;
-        for (k = 0; k < 12; k = k + 1) t[16*k +: 16] = ($time + k) - off;
-        tdata <= t;
+        reg [191:0] t, u;
+        for (k = 0; k < 12; k = k + 1) begin
+            t[16*k +: 16] = ($time + k) - off;
+            u[16*k +: 16] = ($time + k) - off + D1;
+        end
+        tdata <= t; tdata1 <= u;
     end
 
     // ---------------- AWG sequence toggle ----------------
@@ -50,7 +55,7 @@ module tb;
     end endtask
 
     // ---------------- DUT + memory ----------------
-    wire bclk, brst, ben; wire [31:0] bwe, baddr; wire [255:0] bdin; wire mrst;
+    wire bclk, brst, ben; wire [63:0] bwe; wire [31:0] baddr; wire [511:0] bdin; wire mrst;
     adc_capture #(.DEPTH_LOG2(DL)) dut (
         .s_axi_aclk(ps), .s_axi_aresetn(1'b1),
         .s_axi_awaddr(awaddr), .s_axi_awprot(3'd0), .s_axi_awvalid(awvalid), .s_axi_awready(awready),
@@ -59,12 +64,13 @@ module tb;
         .s_axi_araddr(araddr), .s_axi_arprot(3'd0), .s_axi_arvalid(arvalid), .s_axi_arready(arready),
         .s_axi_rdata(rdata), .s_axi_rresp(rresp), .s_axi_rvalid(rvalid), .s_axi_rready(rready),
         .adc_clk(adc), .adc_aresetn(1'b1), .s_axis_tdata(tdata), .s_axis_tvalid(1'b1), .s_axis_tready(),
+        .s1_axis_tdata(tdata1), .s1_axis_tvalid(1'b1), .s1_axis_tready(),
         .bram_clk(bclk), .bram_rst(brst), .bram_en(ben), .bram_we(bwe), .bram_addr(baddr),
-        .bram_din(bdin), .bram_dout(256'd0),
+        .bram_din(bdin), .bram_dout(512'd0),
         .clk_awg(awg), .clk_frm(frm), .mmcm_locked(1'b1), .mmcm_reset(mrst),
         .awg_seq0_tog(seq), .awg_seq2_tog(1'b0), .ctrl_trig(1'b0));
-    reg [255:0] mem [0:DEPTH-1];
-    always @(posedge bclk) if (ben) mem[baddr >> 5] <= bdin;
+    reg [511:0] mem [0:DEPTH-1];
+    always @(posedge bclk) if (ben && &bwe) mem[baddr >> 6] <= bdin;
 
     // ---------------- helpers ----------------
     integer errors = 0;
@@ -72,8 +78,11 @@ module tb;
     function signed [15:0] smp(input integer beat, input integer s);
         smp = mem[beat % DEPTH][16*s +: 16];
     endfunction
+    function signed [15:0] smp1(input integer beat, input integer s);     // ch1 (bits 256 +)
+        smp1 = mem[beat % DEPTH][256 + 16*s +: 16];
+    endfunction
 
-    task capture(input [2:0] mode, input integer pre, input integer post, output integer taddr, output integer tsub);
+    task capture(input [3:0] mode, input integer pre, input integer post, output integer taddr, output integer tsub);
         integer t0; begin
         wr(7'h04, mode); wr(7'h0C, pre); wr(7'h10, post);
         wr(7'h00, 1);                                  // ARM
@@ -94,6 +103,14 @@ module tb;
         for (b = 0; b < pre + post; b = b + 1)
             if (((smp((taddr - pre + b + DEPTH) % DEPTH, 0) - base - 12 * b) & 32'hFFFF) != 0) e = e + 1;
         if (e) begin $display("ERROR: window not contiguous (%0d bad beats)", e); errors = errors + 1; end
+        // ch1 must be sample-aligned with ch0 in every memory word: ch1 = ch0 + D1, upper bits zero
+        e = 0;
+        for (b = 0; b < pre + post; b = b + 1)
+            for (k = 0; k < 12; k = k + 1)
+                if (((smp1((taddr - pre + b + DEPTH) % DEPTH, k) - smp((taddr - pre + b + DEPTH) % DEPTH, k) - D1) & 32'hFFFF) != 0) e = e + 1;
+        for (b = 0; b < pre + post; b = b + 1)
+            if (mem[(taddr - pre + b + DEPTH) % DEPTH][511:448] !== 0 || mem[(taddr - pre + b + DEPTH) % DEPTH][255:192] !== 0) e = e + 1;
+        if (e) begin $display("ERROR: ch1 not aligned with ch0 (%0d bad samples)", e); errors = errors + 1; end
     end endtask
 
     integer ta, ts, i, ofs, ofs0, j, delay;
@@ -101,7 +118,7 @@ module tb;
     initial begin
         #2000;
         rd(7'h28, v); $display("ID %h", v);
-        rd(7'h30, v); $display("CFG %h (NS=%0d words=%0d sync=%0d)", v, v[7:0], v[15:8], v[16]);
+        rd(7'h30, v); $display("CFG %h (NS=%0d words=%0d sync=%0d nch=%0d)", v, v[7:0], v[15:8], v[16], v[27:24]);
         rd(7'h34, v); $display("FS_KHZ %0d", v);
         rd(7'h24, v); $display("DEPTH %0d", v);
 
@@ -159,6 +176,23 @@ module tb;
             check_window(ta, 10, 10);
         end
         $display("level rising: all sample positions checked");
+
+        // ---- level trigger on ch1 (MODE bit 3): ch1 crosses 0 where ch0 = -D1
+        for (i = 0; i < 24; i = i + 1) begin
+            off = 1000000;
+            capture(4'h9, 10, 10, ta, ts);
+            wr(7'h08, 0);
+            repeat (5) @(posedge adc);
+            @(posedge adc); off = $time + 200 + i;
+            wait_done(ta, ts);
+            if (smp1(ta, ts) !== 0 || (ts > 0 && smp1(ta, ts - 1) !== -1) || (ts == 0 && smp1(ta - 1, 11) !== -1)) begin
+                $display("ERROR level ch1 i=%0d: TADDR=%0d TSUB=%0d ch1=%0d ch0=%0d", i, ta, ts, smp1(ta, ts), smp(ta, ts)); errors = errors + 1;
+            end
+            if (smp(ta, ts) !== -D1) begin $display("ERROR level ch1 i=%0d: ch0=%0d at trigger, expected %0d", i, smp(ta, ts), -D1); errors = errors + 1; end
+            check_window(ta, 10, 10);
+        end
+        $display("level rising on ch1: all sample positions checked");
+        rd(7'h04, v); if (v !== 32'h9) begin $display("ERROR MODE readback %h", v); errors = errors + 1; end
 
         // ---- immediate + force
         off = 0;

@@ -1,6 +1,11 @@
-"""adc_scope.py  (v4)  -  triggered ADC scope for the AWG overlay (PYNQ, RFSoC 4x2)
+"""adc_scope.py  (v5)  -  triggered ADC scope for the AWG overlay (PYNQ, RFSoC 4x2)
 
-Hardware (fpga/tcl/add_adc.tcl): ADC (vin0_01) -> trigger engine -> BRAM ring buffer.
+Hardware (fpga/tcl/add_adc.tcl): ADC D (vin0_01) [+ vin0_23 on v5] -> trigger engine -> BRAM ring buffer.
+v5 bitstream (awg_adc_v5.bit): TWO channels captured together, sample-aligned (same ADC tile):
+    ch0 = ADC D (slice 00, vin0_01)      ch1 = slice 02 (vin0_23, the other input of tile 224)
+    acquire() then returns y with shape (2, N): y[0] = ch0, y[1] = ch1.
+    configure(..., channel=1) makes the level trigger look at ch1.
+Single-channel bitstreams (v3, v4) still work: y is then 1-D as before.
 The ADC side never stalls, so every capture is gap-free, and it can be re-armed forever.
 Current bitstream: awg_adc_v4.bit, raw 4.9152 GSps (no decimation), 12 samples/beat,
 196608 samples (40 us), ADC clock locked to the AWG ch0 clock.
@@ -39,9 +44,11 @@ R_STATUS, R_TADDR, R_TSUB, R_TTIME = 0x14, 0x18, 0x1C, 0x20
 R_DEPTH, R_ID, R_ALIVE = 0x24, 0x28, 0x2C
 R_CFG, R_FS_KHZ, R_CLKCTL = 0x30, 0x34, 0x38
 CORE_ID_V3 = 0xADC50003       # older 2.4576 GSps core (awg_adc.bit, awg_adc_v3.bit), no CFG register
-CORE_ID = 0xADC50004
+CORE_ID = 0xADC50004          # v4: 1 channel
+CORE_ID_V5 = 0xADC50005       # v5: 2 channels (CFG[27:24])
 MODES = {"immediate": 0, "rising": 1, "falling": 2, "awg0": 3, "awg2": 4,
          "ctrl_rise": 5, "ctrl_fall": 6, "manual": 7}
+CH_NAMES = {0: "ch0 ADC D (vin0_01)", 1: "ch1 vin0_23"}
 STATES = {0: "idle", 1: "filling pre-trigger", 2: "waiting for trigger", 3: "post-trigger", 4: "done"}
 
 
@@ -84,8 +91,10 @@ class AdcScope:
         self.regs = MMIO(c["phys_addr"], c["addr_range"])
         self.mem = MMIO(m["phys_addr"], m.get("addr_range", m.get("size", 262144)))
         ident = self.regs.read(R_ID)
-        if ident == CORE_ID:
+        self.nch = 1
+        if ident in (CORE_ID, CORE_ID_V5):
             cfg = self.regs.read(R_CFG)
+            self.nch = max(1, (cfg >> 24) & 0xF)
             self.spb = cfg & 0xFF                        # samples per beat
             self.wpb = (cfg >> 8) & 0xFF                 # 32-bit words per beat in memory
             self.awg0_locked = bool(cfg & 0x10000)
@@ -93,7 +102,7 @@ class AdcScope:
         elif ident == CORE_ID_V3:
             self.spb, self.wpb, self.awg0_locked, self.fs = 8, 4, False, 2.4576e9
         else:
-            raise RuntimeError(f"ADC core ID is {ident:#x}, expected {CORE_ID:#x}: wrong bitstream?")
+            raise RuntimeError(f"ADC core ID is {ident:#x}, expected {CORE_ID_V5:#x}: wrong bitstream?")
         self.full = self.awg0_locked
         self.beat_ns = self.spb / self.fs * 1e9
         self.awg0_offset_ns = 0.0                        # set by calibrate_awg0()
@@ -111,7 +120,7 @@ class AdcScope:
 
     def __repr__(self):
         mode = "raw, AWG-locked" if self.full else "2.4576 GSps decimated (old bitstream)"
-        return (f"AdcScope({mode}, {self.fs / 1e9:.4f} GSps, {self.spb} samples/beat, "
+        return (f"AdcScope({mode}, {self.nch} channel(s), {self.fs / 1e9:.4f} GSps, {self.spb} samples/beat, "
                 f"{self.depth * self.spb} samples = {self.depth * self.beat_ns / 1000:.1f} us)")
 
     # ---------------------------------------------------------------- ADC clock (MMCM)
@@ -140,8 +149,9 @@ class AdcScope:
             raise RuntimeError("ADC clock locked but no ADC data: check the RFDC ADC tile state")
 
     # ---------------------------------------------------------------- settings
-    def configure(self, trigger="rising", level=0.05, pre_ns=100.0, length_ns=2000.0):
+    def configure(self, trigger="rising", level=0.05, pre_ns=100.0, length_ns=2000.0, channel=0):
         """level: fraction of full scale (-1..1). pre_ns: time shown before the trigger.
+        channel: which input the level trigger ("rising"/"falling") looks at (v5: 0 = ADC D, 1 = vin0_23).
         length_ns: total window (max depth * beat: 40 us; 53 us on the old 2.4576 GSps bitstreams)."""
         if trigger not in MODES:
             raise ValueError(f"trigger must be one of {list(MODES)}")
@@ -150,11 +160,13 @@ class AdcScope:
         total = max(total, pre + 2)
         if total > self.depth:
             raise ValueError(f"window too long: max {self.depth * self.beat_ns / 1000:.1f} us")
-        self.trigger, self.level = trigger, float(level)
+        if not 0 <= channel < self.nch:
+            raise ValueError(f"channel must be 0..{self.nch - 1} on this bitstream")
+        self.trigger, self.level, self.trig_ch = trigger, float(level), int(channel)
         self.pre, self.post = pre, total - pre
         code = int(np.clip(round(level * FULL_SCALE), -32768, 32767)) & 0xFFFF
         self.regs.write(R_CTRL, 4)                         # abort anything running
-        self.regs.write(R_MODE, MODES[trigger])
+        self.regs.write(R_MODE, MODES[trigger] | (8 if self.trig_ch else 0))
         self.regs.write(R_LEVEL, code)
         self.regs.write(R_PRE, self.pre)
         self.regs.write(R_POST, self.post)
@@ -201,8 +213,11 @@ class AdcScope:
             k = self.depth - start
             w = np.concatenate([np.array(self.words[W * start: W * self.depth]),
                                 np.array(self.words[0: W * (n - k)])])
-        x = w.view(np.int16).reshape(n, 2 * W)[:, :self.spb]   # v4: 12 samples + 4 unused per word
-        return x.reshape(-1), tsub, ttime
+        # each memory word: nch blocks of (2W/nch) int16, the first spb of each block are samples
+        blk = 2 * W // self.nch
+        x = w.view(np.int16).reshape(n, self.nch, blk)[:, :, :self.spb]
+        x = x.transpose(1, 0, 2).reshape(self.nch, -1)          # (nch, n*spb)
+        return (x[0] if self.nch == 1 else x), tsub, ttime
 
     # ---------------------------------------------------------------- user level
     def acquire(self, timeout=0.5, auto=True, raw=False):
@@ -220,12 +235,13 @@ class AdcScope:
         x, tsub, ttime = self.read_window()
         k = self.pre * self.spb + (tsub if triggered else 0)   # index of the trigger sample
         t0 = float(k)
+        xt = x if x.ndim == 1 else x[self.trig_ch]               # the channel the trigger looked at
         if triggered and self.trigger in ("rising", "falling") and k > 0:
             lv = self.level * FULL_SCALE
-            a, b = float(x[k - 1]), float(x[k])
+            a, b = float(xt[k - 1]), float(xt[k])
             if b != a:
                 t0 = (k - 1) + np.clip((lv - a) / (b - a), 0.0, 1.0)
-        t = (np.arange(len(x)) - t0) / self.fs * 1e9
+        t = (np.arange(xt.size) - t0) / self.fs * 1e9
         if triggered and self.full and self.trigger == "awg0":
             t = t - self.awg0_offset_ns
         self.last = {"triggered": triggered, "trig_time_ns": ttime * self.beat_ns, "t0_index": t0}
@@ -239,11 +255,13 @@ class AdcScope:
             t, y = self.acquire(**kw)
             if t_ref is None:
                 t_ref, acc = t, y.astype(np.float64)
-            else:
+            elif y.ndim == 1:
                 acc += np.interp(t_ref, t, y)
+            else:
+                acc += np.stack([np.interp(t_ref, t, row) for row in y])
         return t_ref, acc / n
 
-    def calibrate_awg0(self, edge_ns=0.0, n=8, frac=0.5, **kw):
+    def calibrate_awg0(self, edge_ns=0.0, n=8, frac=0.5, channel=0, **kw):
         """Loopback cable DAC ch0 -> ADC: play a waveform with a sharp rising edge
         at edge_ns after the sequence start, then call this. Afterwards t = 0 of awg0 captures is the
         sequence start as it appears at the ADC input. Returns (offset_ns, spread_ns).
@@ -256,7 +274,7 @@ class AdcScope:
         try:
             for _ in range(n):
                 t, y = self.acquire(auto=False, **kw)
-                p = find_pulses(t, y, frac)
+                p = find_pulses(t, y if y.ndim == 1 else y[channel], frac)
                 if not p:
                     raise RuntimeError("no edge found: check the cable, the waveform and the window")
                 starts.append(p[0]["start_ns"])
@@ -271,7 +289,13 @@ class AdcScope:
     def plot(t, y, title=None):
         import matplotlib.pyplot as plt
         plt.figure(figsize=(10, 3.5))
-        plt.plot(t, y, lw=0.8)
+        y = np.asarray(y)
+        if y.ndim == 1:
+            plt.plot(t, y, lw=0.8)
+        else:
+            for c, row in enumerate(y):
+                plt.plot(t, row, lw=0.8, label=CH_NAMES.get(c, f"ch{c}"))
+            plt.legend(loc="upper right")
         plt.axvline(0, color="k", lw=0.5, ls=":")
         plt.xlabel("time from trigger (ns)")
         plt.ylabel("ADC (fraction of full scale)")
@@ -286,7 +310,9 @@ class AdcScope:
         import matplotlib.pyplot as plt
         from IPython.display import display
         fig, ax = plt.subplots(figsize=(10, 3.5))
-        line, = ax.plot([], [], lw=0.8)
+        lines = [ax.plot([], [], lw=0.8, label=CH_NAMES.get(c, f"ch{c}"))[0] for c in range(self.nch)]
+        if self.nch > 1:
+            ax.legend(loc="upper right")
         ax.axvline(0, color="k", lw=0.5, ls=":")
         ax.set_xlabel("time from trigger (ns)")
         ax.set_ylabel("ADC (fraction of full scale)")
@@ -297,14 +323,16 @@ class AdcScope:
         try:
             while frames is None or i < frames:
                 t, y = self.average(avg, **kw) if avg > 1 else self.acquire(**kw)
-                line.set_data(t, y)
+                rows = [y] if y.ndim == 1 else list(y)
+                for ln, row in zip(lines, rows):
+                    ln.set_data(t, row)
                 ax.set_xlim(t[0], t[-1])
                 if ylim:
                     ax.set_ylim(*ylim)
                 else:
                     ax.relim(); ax.autoscale_view(scalex=False)
                 now = time.time()
-                p = find_pulses(t, y)
+                p = find_pulses(t, rows[min(getattr(self, "trig_ch", 0), len(rows) - 1)])
                 txt = f"{self.trigger}  {1 / max(now - t_last, 1e-3):.1f} fps"
                 if not self.last["triggered"]:
                     txt += "  [AUTO - no trigger]"

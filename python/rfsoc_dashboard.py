@@ -39,6 +39,7 @@ Then pick "ADC capture" in the scope's Source menu and press Run.
 
 from __future__ import annotations
 
+import inspect
 import threading
 import time
 import warnings
@@ -104,12 +105,12 @@ class DemoScope:
     def configure(self, trigger="awg2", level=0.0, pre_ns=10, length_ns=1000):
         self.cfg = dict(trigger=trigger, level=level, pre_ns=pre_ns, length_ns=length_ns)
 
-    def calibrate_awg0(self):
+    def calibrate_awg0(self, *args, **kw):
         """Simulated calibration: returns (offset_ns, spread_ns), always locked."""
         time.sleep(0.2)
         return -self.latency_ns, 0.0
 
-    def acquire(self, timeout=5.0):
+    def acquire(self, timeout=5.0, **kw):
         c = self.cfg
         n = max(2, int(c["length_ns"] * 1e-9 * self.fs))
         t_ns = np.arange(n) / self.fs * 1e9 - c["pre_ns"]
@@ -268,6 +269,12 @@ class AWGDashboard:
                                          layout=w.Layout(width="165px"), style={"description_width": "75px"})
         self.timeout = w.BoundedFloatText(value=0.5, min=0.05, max=600, step=0.5, description="Timeout [s]",
                                           layout=w.Layout(width="160px"), style={"description_width": "80px"})
+        self.adc_ch = w.Dropdown(options=[("ADC 0", 0), ("ADC 1", 1)], value=0, description="ADC",
+                                 layout=w.Layout(width="130px"), style={"description_width": "35px"},
+                                 tooltip="Which ADC channel is displayed and used for calibration")
+        self.adc_ch.observe(lambda _: setattr(self, "_cfg", None), names="value")
+        self.cal_pulse = w.Checkbox(value=True, indent=False,
+                                    description="Calibrate with a 10 ns baseband pulse (restores your settings after)")
         self.btn_cal = w.Button(description="Calibrate", icon="crosshairs",
                                 tooltip="Repeat scope.calibrate_awg0() until locked (spread <= 0.01 ns), then "
                                         "set trigger=awg0 and Pre = -offset")
@@ -331,8 +338,8 @@ class AWGDashboard:
         hw = w.HBox([self.btn_play, self.btn_stop, self.slot_sel, self.live])
         scope_bar = [w.HBox([self.source, self.run, self.rate]), self.autoplay]
         if self.scope is not None:
-            scope_bar += [w.HBox([self.trig, self.level, self.pre_ns, self.len_ns, self.timeout]),
-                          w.HBox([self.btn_cal, self.cal_info]),
+            scope_bar += [w.HBox([self.adc_ch, self.trig, self.level, self.pre_ns, self.len_ns, self.timeout]),
+                          w.HBox([self.btn_cal, self.cal_pulse, self.cal_info]),
                           w.HBox([self.overlay, self.offset, self.btn_align])]
         self.ui = w.VBox([
             w.HTML("<h2>RFSoC 4x2 AWG &amp; scope</h2>"),
@@ -561,14 +568,33 @@ class AWGDashboard:
         self.cal_info.value = "<span style='color:#7f8c8d'>calibrating...</span>"
 
         def work():
+            used_pulse = False
             try:
-                if self.autoplay.value and self.awg.state != "playing":
+                ch = self.adc_ch.value
+                if self.cal_pulse.value:
+                    # A continuous tone has no edge to lock on: play a short baseband pulse instead.
+                    cal = Pulse(freq=0.0, amp=0.1, start=0.0, duration=10 * ns, shape="rect")
+                    for dac in ("DAC_A", "DAC_B"):
+                        for name, _ in SLOT_NAMES:
+                            self.awg.set_waveform(dac, name, cal)
+                    used_pulse = True
+                    self._hw(self.awg.play, "calibration pulse")
+                elif self.autoplay.value and self.awg.state != "playing":
                     self._hw(self.awg.play)         # the DAC must be running to calibrate
+                kw = {}
+                try:                                # V5 AdcScope.calibrate_awg0(channel=...) if present
+                    if "channel" in inspect.signature(self.scope.calibrate_awg0).parameters:
+                        kw["channel"] = ch
+                except (TypeError, ValueError):
+                    pass
                 with self._lock:                    # no scope capture during calibration
-                    offset_ns, spread_ns = self.scope.calibrate_awg0()
+                    # calibration must trigger on the AWG start, not on whatever the scope was left on
+                    self.scope.configure(trigger="awg0", pre_ns=max(self.pre_ns.value, 20.0),
+                                         length_ns=max(self.len_ns.value, 200.0))
+                    offset_ns, spread_ns = self.scope.calibrate_awg0(**kw)
                     tries = 1
                     while spread_ns > tol_ns and tries < max_tries:     # not locked -> again
-                        offset_ns, spread_ns = self.scope.calibrate_awg0()
+                        offset_ns, spread_ns = self.scope.calibrate_awg0(**kw)
                         tries += 1
                 locked = spread_ns <= tol_ns
                 modes = list(self.trig.options)
@@ -585,8 +611,12 @@ class AWGDashboard:
                                  ok=f"calibrated: offset {offset_ns:.3f} ns after {tries} attempt(s)")
             except Exception as exc:
                 self.cal_info.value = ""
-                self._set_status([f"Calibrate: {type(exc).__name__}: {exc}"])
+                self._set_status([f"Calibrate (ADC {self.adc_ch.value}): {type(exc).__name__}: {exc}"
+                                  " - is the loopback cable on this ADC?"])
             finally:
+                if used_pulse:                      # put the user's pulses back on the DACs
+                    self._apply(draw=True)
+                    self._hw(self.awg.play, "restore waveforms")
                 self.btn_cal.disabled = False
 
         threading.Thread(target=work, daemon=True).start()
@@ -619,7 +649,13 @@ class AWGDashboard:
                 self.scope.configure(**kw)
                 self._cfg = cfg
             t_ns, y = self.scope.acquire(timeout=self.timeout.value)
-            t_ns, y = np.asarray(t_ns, float).ravel(), np.asarray(y, float).ravel()
+            t_ns, y = np.asarray(t_ns, float).ravel(), np.asarray(y, float)
+            if y.ndim > 1:                          # several ADC channels: (n_ch, N) or (N, n_ch)
+                ax = 0 if y.shape[-1] == len(t_ns) else 1
+                y = np.take(y, min(self.adc_ch.value, y.shape[ax] - 1), axis=ax)
+            y = y.ravel()
+            if len(y) != len(t_ns):
+                raise ValueError(f"scope returned {len(y)} samples for {len(t_ns)} time points")
             fs = 1e9 / float(np.median(np.diff(t_ns)))
             last = getattr(self.scope, "last", None)
             trig_txt = ""

@@ -9,26 +9,25 @@ GPIO registers) behind a small API so you only think about *pulses*:
 
     from rfsoc_awg import *
 
-    awg = AWG(window=6.65*us)                       # length of one waveform slot
-    awg.set_waveform("DAC_A", "z",                  # which output / which slot
+    awg = AWG(window=6.65*us)                       # length of the (looping) waveform
+    awg.set_waveform("A",                           # which output: DAC "A" or "B"
                      Pulse(freq=60*MHz, power_dbm=-20,
                            start=1*us, duration=2*us, shape="gauss"))
     awg.plot()                                      # look before you play
     awg.connect(); awg.play()                       # talk to the board
     ... edit waveforms ...;   awg.play()            # re-upload: takes effect immediately
-    awg.select_slot("x")                            # switch slot instantly, no upload
 
-Hardware model (bitstreams `awg_clock_syncd.bit` / `awg_adc.bit`, RTL fpga/src/awg_BRAM_dual.v)
------------------------------------------------------------------------------------------------
-* 2 outputs:  "DAC_B" (hardware channel 0) and "DAC_A" (hardware channel 2).
+Hardware model (bitstream `awg_adc_v5.bit`, RTL fpga/src/awg_BRAM_dual.v)
+--------------------------------------------------------------------------
+* 2 outputs:  DAC "B" (hardware channel 0, DAC tile 0) and DAC "A" (hardware channel 2,
+  DAC tile 2). This mapping is the CHANNELS table below; adc_scope.py uses it too.
 * The DAC runs at 9.8304 GS/s  ->  1 sample = 101.7 ps.
 * The fabric hands the DAC 16 samples per clock cycle (614.4 MHz -> 1.6276 ns).
   => the length of a waveform is always a multiple of 16 samples.
-* Every output owns TWO waveform "slots" (named "z" and "x" here, or 0 and 1),
-  each up to 2**18 samples = 26.67 us long.  Both slots use the same length
-  (the `window`), because the bitstream has a single MAX_POINTS register.
-* ONE slot plays at a time, looping forever: `select_slot("z")` / `select_slot("x")`
-  (register axi_control, OR-ed with the external control_trigger pin).
+* Every output plays ONE waveform, up to 2**18 samples = 26.67 us long (the `window`),
+  looping forever.  The RAM has two halves ("slots" z / x), selected by
+  (axi_control OR the control_trigger pin).  The pin floats high on this board, so only
+  slot x is usable: the driver sets axi_control = 1 (x always) and leaves z at zeros.
 * Samples are 16-bit signed integers (two's complement).
 
 Units
@@ -55,7 +54,7 @@ __all__ = [
     "AWG", "Pulse", "chirp", "render_pulses", "pack_channel",
     "dbm_to_vpk", "dbm_to_vpp", "vpp_to_dbm", "print_clocks",
     "ns", "us", "ms", "kHz", "MHz", "GHz",
-    "DAC_SR", "SLOT_SAMPLES", "SAMPLES_PER_CLK",
+    "DAC_SR", "SLOT_SAMPLES", "SAMPLES_PER_CLK", "CHANNELS", "STREAM_ORDER",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -81,12 +80,12 @@ DAC_FULL_SCALE_CODE = 2 ** 15   # int16 range is [-32768, 32767]
 VPP_AT_FULL_SCALE = 0.5      # [V peak-to-peak]
 LOAD_OHMS = 50.0             # impedance used for dBm <-> volt conversions
 
-# Names -> hardware channel index (the number in the IP names `enable_ch<N>`)
-CHANNELS = {"DAC_B": 0, "DAC_A": 2}
-# Order in which the channels are laid out in the DMA stream (must match RTL).
-STREAM_ORDER = ("DAC_B", "DAC_A")
-# Friendly slot names
-SLOTS = {"z": 0, "x": 1, 0: 0, 1: 1}
+# DAC letter -> hardware channel = DAC tile (the number in `enable_ch<N>`, and in the ADC
+# core's sequence-start trigger). THE one place to flip if the board labels turn out swapped.
+CHANNELS = {"B": 0, "A": 2}
+# Order in which the channels are laid out in the DMA stream (must match RTL: tile 0 first).
+STREAM_ORDER = tuple(sorted(CHANNELS, key=CHANNELS.get))
+X_SLOT = 1                   # RAM half that plays (axi_control = 1); slot z (0) stays zero
 
 
 # --------------------------------------------------------------------------- #
@@ -134,7 +133,7 @@ class Pulse:
                 notebook).  Give EXACTLY ONE of `power_dbm`, `vpp`, `amp`.
     vpp         Peak-to-peak voltage [V] at the peak of the envelope.
     amp         Peak voltage [V], SIGNED (amp=-0.1 gives an inverted pulse).
-    start       When the pulse begins, measured from the start of the slot [s].
+    start       When the pulse begins, measured from the start of the window [s].
     duration    Length of the pulse [s].  None = until the end of the window.
     phase_deg   Carrier phase [deg].
     shape       "rect"  : constant amplitude (hard edges)
@@ -152,7 +151,7 @@ class Pulse:
                 * numpy array in [-1, 1], one value per DAC sample.  Its length
                   sets the duration (or must match `duration` if you give it).
                 `freq` must stay 0 when `wave` is used.
-    phase_ref   "window": phase is referenced to t=0 of the slot, so pulses of
+    phase_ref   "window": phase is referenced to t=0 of the window, so pulses of
                           the same frequency stay phase-coherent with each other
                           and with the other channel (best for qubit control).
                 "pulse" : phase restarts at 0 at the beginning of every pulse.
@@ -302,7 +301,7 @@ class AWG:
     Typical use (see the notebook for a full example):
 
         awg = AWG(window=6.65*us)
-        awg.set_waveform("DAC_B", "z", Pulse(freq=20*MHz, power_dbm=-25))
+        awg.set_waveform("B", Pulse(freq=20*MHz, power_dbm=-25))
         awg.plot()
         awg.connect()
         awg.upload()
@@ -311,11 +310,11 @@ class AWG:
         awg.stop()
     """
 
-    def __init__(self, window: float, bitfile="./awg_clock_syncd.bit",
+    def __init__(self, window: float, bitfile="./awg_adc_v5.bit",
                  dry_run: bool = False, lmk_freq: float = 245.76,
                  lmx_freq: float = 491.52, verbose: bool = True):
         """
-        window    Length of ONE waveform slot [s] (max 26.67 us).  It is rounded
+        window    Length of the waveform [s] (max 26.67 us).  It is rounded
                   to a multiple of 16 samples (1.6276 ns); see `awg.window`.
         bitfile   Path to the FPGA bitstream (.bit, with its .hwh next to it),
                   OR an already-loaded pynq `Overlay` (then connect() reuses it:
@@ -329,18 +328,17 @@ class AWG:
         """
         self.bitfile, self.dry_run, self.verbose = bitfile, dry_run, verbose
         self.lmk_freq, self.lmx_freq = lmk_freq, lmx_freq
-        self._waves: dict = {}          # (channel name, slot index) -> volts
+        self._waves: dict = {}          # DAC letter -> volts
         self._gpio: dict = {}
         self._dma = None
         self._ol = None
         self._uploaded = False
         self._running = False
-        self.slot_playing = 0           # 0 = "z", 1 = "x" (axi_control)
         self.set_window(window)
 
     # ---- window / time base ------------------------------------------------ #
     def set_window(self, duration: float) -> None:
-        """(Re)define the slot length.  Clears all waveforms if it changes."""
+        """(Re)define the window length.  Clears all waveforms if it changes."""
         n = int(round(duration * DAC_SR / SAMPLES_PER_CLK)) * SAMPLES_PER_CLK
         if not (SAMPLES_PER_CLK <= n <= SLOT_SAMPLES):
             raise ValueError(
@@ -357,18 +355,18 @@ class AWG:
 
     @property
     def window(self) -> float:
-        """Actual slot length [s] after rounding."""
+        """Actual window length [s] after rounding."""
         return self.n_samples / DAC_SR
 
     @property
     def max_points(self) -> int:
-        """Clock cycles (16-sample words) per slot.  The MAX_POINTS register gets
+        """Clock cycles (16-sample words) per window.  The MAX_POINTS register gets
         this minus 1, because the hardware read counter includes its end value."""
         return self.n_samples // SAMPLES_PER_CLK
 
     @property
     def t(self) -> np.ndarray:
-        """Time axis [s] of one slot (use it to build custom waveforms)."""
+        """Time axis [s] of the window (use it to build custom waveforms)."""
         return np.arange(self.n_samples) / DAC_SR
 
     def coherent_freq(self, freq: float) -> float:
@@ -378,51 +376,49 @@ class AWG:
         return cycles / self.window
 
     # ---- defining waveforms ------------------------------------------------ #
-    def set_waveform(self, channel, slot, content) -> None:
+    def set_waveform(self, dac, content) -> None:
         """
-        Define what a slot of a channel plays.
+        Define what a DAC plays.
 
-        channel  "DAC_A" or "DAC_B"   (also accepted: hardware index 2 / 0)
-        slot     "z" or "x"           (also accepted: 0 / 1)
+        dac      "A" or "B"
         content  * a `Pulse`, or a list of `Pulse` objects (summed), or
                  * a numpy array of instantaneous VOLTS (len <= window samples;
                    shorter arrays are padded with zeros), or
-                 * None to clear the slot (outputs zero).
+                 * None to clear it (outputs zero).
         """
-        ch, sl = self._channel(channel), self._slot(slot)
+        ch = self._channel(dac)
         if content is None:
-            self._waves.pop((ch, sl), None)
+            self._waves.pop(ch, None)
         elif isinstance(content, (Pulse, list, tuple)):
-            self._waves[(ch, sl)] = render_pulses(self.n_samples, content)
+            self._waves[ch] = render_pulses(self.n_samples, content)
         else:
             arr = np.asarray(content, dtype=float).ravel()
             if arr.size > self.n_samples:
                 raise ValueError(f"Array has {arr.size} samples but the window holds "
                                  f"{self.n_samples}. Increase `window` or shorten it.")
-            self._waves[(ch, sl)] = np.pad(arr, (0, self.n_samples - arr.size))
+            self._waves[ch] = np.pad(arr, (0, self.n_samples - arr.size))
         self._uploaded = False
 
     def clear(self) -> None:
-        """Remove every waveform (all slots output zero after the next upload)."""
+        """Remove every waveform (both DACs output zero after the next upload)."""
         self._waves.clear()
         self._uploaded = False
 
     # ---- inspection -------------------------------------------------------- #
     def summary(self) -> None:
-        """Print peak levels of every slot and warn about clipping."""
+        """Print peak levels of every DAC and warn about clipping."""
         print(f"Window: {self.window/us:.4f} us = {self.n_samples} samples "
               f"= {self.max_points} clock cycles (MAX_POINTS)")
         print(f"DAC full scale: +-{MAX_VPK:.3f} V peak (CW {MAX_DBM:.2f} dBm into 50 ohm)")
-        for ch in STREAM_ORDER:
-            for name, sl in (("z", 0), ("x", 1)):
-                v = self._waves.get((ch, sl))
-                if v is None:
-                    print(f"  {ch} slot {name}: (empty)")
-                    continue
-                pk = np.max(np.abs(v))
-                dbm = vpp_to_dbm(2 * pk) if pk > 0 else float("-inf")
-                flag = "  <-- CLIPS!" if pk > MAX_VPK else ""
-                print(f"  {ch} slot {name}: peak {pk*1e3:8.2f} mV  ({dbm:6.2f} dBm){flag}")
+        for ch in sorted(CHANNELS):
+            v = self._waves.get(ch)
+            if v is None:
+                print(f"  DAC {ch}: (empty)")
+                continue
+            pk = np.max(np.abs(v))
+            dbm = vpp_to_dbm(2 * pk) if pk > 0 else float("-inf")
+            flag = "  <-- CLIPS!" if pk > MAX_VPK else ""
+            print(f"  DAC {ch}: peak {pk*1e3:8.2f} mV  ({dbm:6.2f} dBm){flag}")
 
     def plot(self, tmin: float = 0.0, tmax: Optional[float] = None):
         """
@@ -432,16 +428,14 @@ class AWG:
         import matplotlib.pyplot as plt
         tmax = self.window if tmax is None else tmax
         sel = slice(int(tmin * DAC_SR), int(np.ceil(tmax * DAC_SR)))
-        fig, axes = plt.subplots(len(STREAM_ORDER), 1, sharex=True, figsize=(10, 5))
-        for ax, ch in zip(axes, STREAM_ORDER):
-            for name, sl in (("z", 0), ("x", 1)):
-                v = self._waves.get((ch, sl))
-                if v is not None:
-                    ax.plot(self.t[sel] / us, v[sel], lw=0.8, label=f"slot {name}")
+        fig, axes = plt.subplots(len(CHANNELS), 1, sharex=True, figsize=(10, 5))
+        for ax, ch in zip(axes, sorted(CHANNELS)):
+            v = self._waves.get(ch)
+            if v is not None:
+                ax.plot(self.t[sel] / us, v[sel], lw=0.8)
             ax.axhline(MAX_VPK, color="r", ls=":", lw=0.8)
             ax.axhline(-MAX_VPK, color="r", ls=":", lw=0.8)
-            ax.set_ylabel(f"{ch} [V]")
-            ax.legend(loc="upper right")
+            ax.set_ylabel(f"DAC {ch} [V]")
         axes[-1].set_xlabel("time [us]  (dotted red = DAC full scale)")
         fig.tight_layout()
         return fig
@@ -456,11 +450,11 @@ class AWG:
     #                   waveform never changes.
     #   write_enable 1 = RAM write mode (DMA data goes to RAM; DAC outputs read zeros).
     #   MAX_POINTS   read pointer runs 0..MAX_POINTS *inclusive*, so it must be set to
-    #                (words per slot - 1). It loops forever, free running.
-    #   axi_control  SLOT SELECT, not start/stop: 0 plays slot "z", 1 plays slot "x".
-    #                It is OR-ed with the external control_trigger pin, so the pin can
-    #                switch slots in real time.
-    #   enable_ch0/2 output enable of DAC_B / DAC_A (0 = output zeros).
+    #                (words per window - 1). It loops forever, free running.
+    #   axi_control  SLOT SELECT, not start/stop: 0 plays RAM half "z", 1 plays half "x".
+    #                It is OR-ed with the external control_trigger pin, which floats high
+    #                on this board, so z is unreachable: the driver always writes 1 (x).
+    #   enable_ch0/2 output enable of DAC tile 0 / 2 (see CHANNELS; 0 = output zeros).
     #
     def connect(self):
         """
@@ -496,7 +490,7 @@ class AWG:
 
         for idx in CHANNELS.values():                          # known state: outputs off,
             self._write(f"enable_ch{idx}", 0)
-        self._write("axi_control", self.slot_playing)          # slot z
+        self._write("axi_control", 1)                          # slot x, whatever the pin does
         self._reset_writer()
         self._uploaded = False
         self._running = False
@@ -511,8 +505,8 @@ class AWG:
 
     def upload(self) -> None:
         """
-        Send all waveforms (both channels, both slots) to the board RAM and set the
-        slot length.  Safe to call any time, as often as you like: the write pointer
+        Send all waveforms (both DACs) to the board RAM and set the
+        window length.  Safe to call any time, as often as you like: the write pointer
         is reset first.  The outputs read zeros for the ~10 ms the transfer takes,
         then continue with the NEW waveforms (enables are left as they were).
         """
@@ -542,28 +536,21 @@ class AWG:
             self._write("write_enable", 0)             # RAM write mode OFF -> play again
         self._uploaded = True
 
-    def select_slot(self, slot) -> None:
-        """Choose which slot plays: "z" (0) or "x" (1).  Instant, no re-upload.
-        (If the external control_trigger pin is high, slot "x" plays regardless.)"""
-        self.slot_playing = self._slot(slot)
-        self._write("axi_control", self.slot_playing)
-
-    def start(self, channels: Optional[Sequence] = None, slot=None) -> None:
+    def start(self, dacs: Optional[Sequence] = None) -> None:
         """
-        Turn outputs on.  `channels` = e.g. ["DAC_A"]; default = every channel that
-        has a waveform.  `slot` = "z"/"x" to also choose the slot (default: keep).
+        Turn outputs on.  `dacs` = e.g. ["A"]; default = every DAC that has a waveform.
         """
         if not self._uploaded:
             raise RuntimeError("Nothing uploaded yet (or waveforms changed): call upload() first.")
-        if slot is not None:
-            self.select_slot(slot)
-        if channels is None:
-            channels = [c for c in STREAM_ORDER if any(k[0] == c for k in self._waves)]
-        wanted = {self._channel(c) for c in channels}
-        for name in ("DAC_A", "DAC_B"):
-            self._write(f"enable_ch{CHANNELS[name]}", 1 if name in wanted else 0)
+        if isinstance(dacs, str):
+            dacs = [dacs]
+        if dacs is None:
+            dacs = list(self._waves)
+        wanted = {self._channel(c) for c in dacs}
+        for name, idx in CHANNELS.items():
+            self._write(f"enable_ch{idx}", 1 if name in wanted else 0)
         self._running = bool(wanted)
-        self._log(f"Playing slot {'zx'[self.slot_playing]} on {sorted(wanted)}")
+        self._log(f"Playing on DAC {', '.join(sorted(wanted)) or '(none)'}")
 
     def stop(self) -> None:
         """Outputs off (they output zeros).  The RAM content is kept."""
@@ -580,23 +567,21 @@ class AWG:
             return "playing" if self._uploaded else "stale"
         return "ready" if self._uploaded else "stopped"
 
-    def play(self, channels: Optional[Sequence] = None, slot=None) -> None:
+    def play(self, dacs: Optional[Sequence] = None) -> None:
         """Upload the current waveforms and turn the outputs on (use after any edit)."""
         self.upload()
-        self.start(channels, slot)
+        self.start(dacs)
 
     # ---- internals --------------------------------------------------------- #
     def _dma_image(self) -> np.ndarray:
-        """Full int16 stream sent over DMA: [DAC_B (RAM A, RAM B), DAC_A (RAM A, RAM B)]."""
+        """Full int16 stream sent over DMA: per DAC in STREAM_ORDER, (RAM A, RAM B);
+        slot z = zeros, slot x = the waveform."""
         parts = []
         for ch in STREAM_ORDER:
-            slots = []
-            for sl in range(N_SLOTS):
-                padded = np.zeros(SLOT_SAMPLES, dtype=np.int16)    # zero padding to RAM depth
-                v = self._waves.get((ch, sl))
-                if v is not None:
-                    padded[: self.n_samples] = self._to_codes(v, f"{ch} slot {sl}")
-                slots.append(padded)
+            slots = [np.zeros(SLOT_SAMPLES, dtype=np.int16) for _ in range(N_SLOTS)]
+            v = self._waves.get(ch)
+            if v is not None:
+                slots[X_SLOT][: self.n_samples] = self._to_codes(v, f"DAC {ch}")
             parts.append(pack_channel(*slots))
         return np.concatenate(parts)
 
@@ -622,19 +607,10 @@ class AWG:
             raise RuntimeError("Not connected: call awg.connect() first.")
 
     @staticmethod
-    def _channel(ch) -> str:
-        if isinstance(ch, str) and ch.upper() in CHANNELS:
-            return ch.upper()
-        for name, idx in CHANNELS.items():
-            if ch == idx:
-                return name
-        raise ValueError(f"Unknown channel {ch!r}; use 'DAC_A' or 'DAC_B'")
-
-    @staticmethod
-    def _slot(slot) -> int:
-        if slot in SLOTS:
-            return SLOTS[slot]
-        raise ValueError(f"Unknown slot {slot!r}; use 'z' or 'x' (or 0 / 1)")
+    def _channel(dac) -> str:
+        if isinstance(dac, str) and dac.upper() in CHANNELS:
+            return dac.upper()
+        raise ValueError(f"Unknown DAC {dac!r}; use 'A' or 'B' (not 'DAC_A' or a number)")
 
     def _log(self, msg: str) -> None:
         if self.verbose:

@@ -10,11 +10,10 @@ High-sampling-rate, high-memory-density, multi-channel arbitrary waveform genera
 ## Features
 
 - Data sampling at 9.8304 GSps
-- Two output channels: DAC A (DAC0) and DAC B (DAC2)
-- Four waveforms total, each $2^{18}$ samples
-  - DAC A (DAC0): waveform A or B
-  - DAC B (DAC2): waveform C or D
-  - Waveform selection via software (AXI GPIO) or an external signal.
+- Two output channels: DAC B (DAC tile 0) and DAC A (DAC tile 2), see `CHANNELS` in `python/rfsoc_awg.py`
+- One looping waveform per DAC, up to $2^{18}$ samples (26.67 µs)
+  - The RAM has two halves per DAC, selected by (`axi_control` OR the `control_trigger` pin). The pin floats high on this board, so the Python driver always plays half "x" (`axi_control` = 1) and leaves "z" at zero.
+- Two-channel ADC capture (ADC D and ADC C) with triggers on each DAC's sequence start (`dac_b` locked, `dac_a` ±1 beat).
 - Sample loading within 5-7 ms.
 - One ADC input (ADC D) captured raw at the full 4.9152 GSps, with the ADC clock locked to the AWG, pre-trigger, and triggers from the ADC level, the AWG sequence start or the external trigger. See [ADC capture](#adc-capture).
 
@@ -28,7 +27,7 @@ For the memory block RAM[0] and RAM[1], the first $2^{14}$ memory address contai
 
 ### Waveform read block
 On the read side, the address counter increments with a clock signal clk0 for RAM[0],and RAM[1]) and with clk2 for RAM[2], and RAM[3]). Both clocks operate at 614.4 MHz -  16x slower than the DAC sampling rate. 
-At each rising edge of clk0, the 16 samples - 8 samples on RAM[0], and 8 samples on RAM[1] at the same address counter - are concatenated and sent to the DAC IP for output on DAC0 (DAC A). When the waveform select signal : (`control_trigger` || `axi_control`) is high, an offset of $2^{14}$ is added to the base address, so that waveform-B is output on the same dac channel. A similar behavior is implemented to output waveform-C or waveform-D at DAC2.
+At each rising edge of clk0, the 16 samples - 8 samples on RAM[0], and 8 samples on RAM[1] at the same address counter - are concatenated and sent to the DAC IP for output on DAC0 (DAC B). When the waveform select signal : (`control_trigger` || `axi_control`) is high, an offset of $2^{14}$ is added to the base address, so that waveform-B is output on the same dac channel. A similar behavior is implemented to output waveform-C or waveform-D at DAC2.
 
 
 
@@ -48,10 +47,10 @@ Internally, the design is pipelined to meet timing requirements for performance 
 The relevant I/O pins and ports on the board are
 | Name | Pin/Port |  Type | Description |
 | -------- | -------- | -------- | -------- |
-| control_trigger | PMOD0_1 | Input | External waveform-select trigger. Toggles DAC A between waveform-A/waveform-B and DAC B between waveform-C/waveform-D. Effective select: (axi_control || control_trigger)|
+| control_trigger | PMOD0_1 | Input | External waveform-select trigger. Toggles DAC B (DAC0) between waveform-A/waveform-B and DAC A (DAC2) between waveform-C/waveform-D. Effective select: (axi_control || control_trigger)|
 | pmod_out| PMOD0_0  | Output | Outputs control_trigger signal sampled on a 614.4 MHz clock.  |
-| DAC 0| DAC A  | Output | AWG output |
-| DAC 2| DAC B  | Output | AWG output |
+| DAC 0| DAC B  | Output | AWG output |
+| DAC 2| DAC A  | Output | AWG output |
 | ADC | ADC D  | Input | Fast ADC input |
 
 The design contains AXI GPIOs that Python (`python/rfsoc_awg.py`) drives as software-visible registers.
@@ -60,8 +59,8 @@ The design contains AXI GPIOs that Python (`python/rfsoc_awg.py`) drives as soft
 | rst_n | 0x00_A007_0000 | Output |1 bit. Software reset. Active low signal. |
 | write_enable | 0x00_A005_0000  | Output | 1 bit. Enables writing waveform to RAM bank. Set to 0 to enable output; set enable_ch0 and enambe_ch2 accordingly. |
 | MAX_POINTS| 0x00_A006_0000  | Output | 32 bit. (MAX_POINTS<<4) is the maximum number of points to output. |
-| enable_ch0 | 0x00_A009_0000 | Output | 1 bit. Enables output on DAC A when write_enable is low. |
-| enable_ch2 | 0x00_A00A_0000 | Output | 1 bit. Enables output on DAC B when write_enable is low. |
+| enable_ch0 | 0x00_A009_0000 | Output | 1 bit. Enables output on DAC B when write_enable is low. |
+| enable_ch2 | 0x00_A00A_0000 | Output | 1 bit. Enables output on DAC A when write_enable is low. |
 | axi_control| 0x00_A008_0000 | Output | 1 bit. Software trigger signal.  Switches between waveform-A and waveform-B for DAC0 output and between waveform-C and waveform-D for DAC2 output. The effective select signal is (axi_control || control_trigger) |
 | axi_dma_0| 0x00_A004_0000 | Input | AMD's DMA IP for direct memory access and fast transfer of data from PS to PL.|
 | adc (registers) | 0x00_A00B_0000 | In/Out | ADC capture engine control and status, 4 KB. See [ADC capture](#adc-capture). |
@@ -81,7 +80,7 @@ The ADC path records what comes in on the ADC D input, aligned with the AWG outp
 | Level trigger | Sample accurate. `TSUB` gives which of the 12 samples in the trigger beat crossed the level. |
 | AWG ch0 trigger | Locked: the same ADC sample every time, see below. |
 
-**How the ADC stays aligned with the DAC.** The DAC runs at 9.8304 GSps and the ADC at 4.9152 GSps from the same reference, so they never drift apart. The capture logic does not use an RFDC ADC clock: `clk_wiz_adc` makes 409.6 MHz (ADC stream) and 204.8 MHz (frame) from the 614.4 MHz AWG ch0 clock. One frame of 4.883 ns is exactly 3 AWG beats, 2 ADC beats and 24 ADC samples. The AWG sequence-start event goes AWG clock → frame clock → ADC clock through plain registers that Vivado times as synchronous paths, together with its position inside the frame, so the core knows to the sample which ADC sample belongs to the AWG beat where the sequence started. That gives `TADDR`/`TSUB` with no jitter. What is left is a constant delay (DAC and ADC converter latency, cables) that changes only when the RFDC tiles restart. Measure it once per power-up with a loopback cable from DAC A to ADC D: `AdcScope.calibrate_awg0()` does that and then puts t = 0 on the sequence start as seen at the ADC. `awg2` (DAC tile 2) has its own tile clock and stays asynchronous (±1 beat).
+**How the ADC stays aligned with the DAC.** The DAC runs at 9.8304 GSps and the ADC at 4.9152 GSps from the same reference, so they never drift apart. The capture logic does not use an RFDC ADC clock: `clk_wiz_adc` makes 409.6 MHz (ADC stream) and 204.8 MHz (frame) from the 614.4 MHz AWG ch0 clock. One frame of 4.883 ns is exactly 3 AWG beats, 2 ADC beats and 24 ADC samples. The AWG sequence-start event goes AWG clock → frame clock → ADC clock through plain registers that Vivado times as synchronous paths, together with its position inside the frame, so the core knows to the sample which ADC sample belongs to the AWG beat where the sequence started. That gives `TADDR`/`TSUB` with no jitter. What is left is a constant delay (DAC and ADC converter latency, cables) that changes only when the RFDC tiles restart. Measure it once per power-up with a loopback cable from DAC B (tile 0, trigger `dac_b`) to ADC D: `AdcScope.calibrate_awg("B", adc="D")` does that and then puts t = 0 on the sequence start as seen at the ADC. After that, `configure(pre_ns=..., length_ns=...)` is in this calibrated time: the driver captures the longer raw window behind the scenes and crops it, so `pre_ns=5, length_ns=20` shows −5 to +15 ns around the DAC edge. `calibrate_awg("A")` does the same for DAC A (tile 2, trigger `dac_a`), which has its own tile clock and stays asynchronous (±1 beat). The DAC letter ↔ tile mapping is `CHANNELS` in `python/rfsoc_awg.py` (B = tile 0, as in the PYNQ 4x2 base overlay); `adc_scope.py` reads it from there.
 
 The MMCM must lock after the DAC clock runs. `AdcScope(ol)` resets it through the `CLKCTL` register, waits for `STATUS` bit 2 and restarts the ADC tile. Create it after `xrfclk.set_ref_clks()`.
 
@@ -100,13 +99,13 @@ Register map, base address 0x00_A00B_0000 (byte offsets):
 | 0x1C | TSUB | R | Sample index (0 to 11) of the trigger inside its beat, for level triggers and AWG ch0. 0 otherwise. |
 | 0x20 | TTIME | R | ADC clock cycles from ARM to the trigger. |
 | 0x24 | DEPTH | R | Buffer depth in beats (16384). |
-| 0x28 | ID | R | `0xADC50004` (`0xADC50003` in the older 2.4576 GSps bitstreams). Reads something else if the bitstream has no ADC capture. |
+| 0x28 | ID | R | `0xADC50005`. Reads something else if the bitstream has no ADC capture. |
 | 0x2C | ALIVE | R | Free-running count of ADC beats. If it does not move, the ADC clock is not running. |
 | 0x30 | CFG | R | bits [7:0] samples per beat (12), [15:8] 32-bit words per memory word (8), bit 16 AWG ch0 locked (1). |
 | 0x34 | FS_KHZ | R | Sample rate in kHz (4915200). |
 | 0x38 | CLKCTL | R/W | bit 0 resets the ADC clock MMCM (write 1, then 0). |
 
-To read a capture: write PRE, POST, MODE and LEVEL, write CTRL = 1 (ARM), wait for STATUS bit 0 (DONE), then read the capture memory. A beat is one 32-byte memory word, samples in the lower 24 bytes. The valid window starts at beat `TADDR - PRE` and wraps around at DEPTH. `python/adc_scope.py` does all of this; it reads CFG, so it also still works with the older 2.4576 GSps bitstreams. `ALIVE` and `ID` are the first things to check on a new bitstream.
+To read a capture: write PRE, POST, MODE and LEVEL, write CTRL = 1 (ARM), wait for STATUS bit 0 (DONE), then read the capture memory. A beat is one 32-byte memory word, samples in the lower 24 bytes. The valid window starts at beat `TADDR - PRE` and wraps around at DEPTH. `python/adc_scope.py` does all of this; it only accepts the v5 core (2 channels, locked to the AWG). `ALIVE` and `ID` are the first things to check on a new bitstream.
 
 PS registers cross into the ADC clock with XPM CDC macros. The AWG ch2 toggle and `control_trigger` cross the same way (asynchronous); the AWG ch0 toggle uses the frame-locked path described above.
 
@@ -115,8 +114,6 @@ PS registers cross into the ADC clock with XPM CDC macros. The AWG ch2 toggle an
 - `fpga/adc/sim/` — simulation of the ADC core with Icarus Verilog (`run_sim.sh`): triggers, windows and the AWG-locked timing.
 - `fpga/bitstreams/` — ready-to-use `.bit` and `.hwh` pairs, see [Bitstreams](#bitstreams).
 - `python/` — current dashboard (`rfsoc_dashboard.py`, `AWG_dashboard.ipynb`) and the modules it imports (`rfsoc_awg.py`, `adc_scope.py`, `bode_sweep.py`, `bode.ipynb`), plus the LMK and LMX register files. `xrfclk.set_ref_clks` looks for those register files in the working directory.
-- `python/dac_adc/` — earlier DAC+ADC scripts, including their own `rfsoc_awg.py`. `AWG_notebook.ipynb` in that folder loads `awg_adc.bit`.
-- `python/awg_only/` — original AWG-only scripts. `AWG_notebook.ipynb` in that folder loads `awg_clock_syncd.bit`.
 - `assets/` — architecture diagrams.
 
 `fpga/awg_multichannel_rfsoc.tcl` is the single build script (see Modifications). It sources `fpga/bd/block_design.tcl` (Vivado 2024.1 export of the AWG block design), optionally adds the ADC capture path with `fpga/tcl/add_adc.tcl` (RTL in `fpga/adc/hdl/adc_capture.v`), and uses `fpga/constrs/awg_top.xdc`. `fpga/legacy/` holds the earlier DMA-based ADC capture attempt (`add_adc_capture.tcl`, `adc_capture.xdc`, `packet_generator_1.0`), older block-design exports and the original constraints. Nothing in it is used by the build.
@@ -124,16 +121,15 @@ PS registers cross into the ADC clock with XPM CDC macros. The AWG ch2 toggle an
 ## Bitstreams
 A `.bit` always goes with the `.hwh` of the same name. Copy both to the board next to the notebook that loads them.
 
-| Files in `fpga/bitstreams/` | Design | Use with |
+| Files | Design | Use with |
 | -------- | -------- | -------- |
-| `awg_clock_syncd.bit` (inside `awg_clock_syncd.7z`) + `.hwh` | AWG only, 2 DAC channels | `python/awg_only/` |
-| `awg_adc.bit` + `.hwh` | AWG + ADC capture, first version (2.4576 GSps decimated, scope cell named `adc_scope`) | `python/dac_adc/`, the dashboard and `python/adc_scope.py` in `python/` |
-| `awg_adc_v4.bit` + `.hwh` | AWG + ADC capture, current design (4.9152 GSps raw, locked to AWG ch0), produced by the build script | `python/adc_scope.py` |
+| `python/awg_adc_v5.bit` + `.hwh` | AWG + 2-channel ADC capture (4.9152 GSps raw, locked to AWG ch0), produced by the build script | everything in `python/` (default bitstream of `rfsoc_awg.AWG`) |
+| `fpga/bitstreams/awg_clock_syncd.bit` (inside `awg_clock_syncd.7z`) + `.hwh` | AWG only, 2 DAC channels, no ADC | `python/rfsoc_awg.py` with `bitfile=` |
 
-`awg_adc_v4` only appears after you run the build script (see [Building the FPGA design](#building-the-fpga-design)). Its ADC cells are named `adc` and `axi_bram_ctrl_adc`. `python/adc_scope.py` handles it and the older `awg_adc.bit`; the scripts in `python/dac_adc/` only handle `awg_adc.bit`.
+The ADC cells of `awg_adc_v5` are named `adc` and `axi_bram_ctrl_adc`. `python/adc_scope.py` only accepts this bitstream.
 
 ## Usage
-1. On the board, put in one folder: the notebook you want from `python/`, `python/dac_adc/`, or `python/awg_only/`; `python/LMK04828_245.76.txt` and `python/LMX2594_491.52.txt`; and the matching `.bit` and `.hwh` from `fpga/bitstreams/`. For the original design, extract `awg_clock_syncd.7z` to obtain the `.bit`.
+1. On the board, put in one folder: the notebook you want from `python/`; `python/LMK04828_245.76.txt` and `python/LMX2594_491.52.txt`; and `awg_adc_v5.bit` + `.hwh`. For the AWG-only design, extract `fpga/bitstreams/awg_clock_syncd.7z` to obtain the `.bit`.
 2. For the dashboard, copy `rfsoc_dashboard.py` and `rfsoc_awg.py` into that same folder. Packages beyond the PYNQ image are listed in `requirements.txt`.
 3. Run the notebook from the Linux OS on the FPGA.
 

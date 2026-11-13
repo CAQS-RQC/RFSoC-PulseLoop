@@ -2,7 +2,7 @@
 bode_point.py -- measure one point at a time with an EXTERNAL generator and add it to a Bode plot.
 
     from bode_point import Bode
-    b = Bode(sc, gen_vpk=0.1, adc_vfs=None)     # gen_vpk: peak volts the generator sends (constant!)
+    b = Bode(sc, gen_vpk=0.1, adc_vfs=None, channel="D")   # gen_vpk: peak volts the generator sends (constant!)
     b.point()          # generator set to a new frequency -> call this, a point appears on the plot
     b.point(f=50e6)    # same, but give the frequency yourself (skips auto-detection)
     b.save("bode.csv"); b.clear()
@@ -15,8 +15,6 @@ import csv
 import numpy as np
 import matplotlib.pyplot as plt
 
-# ADC_FS = 2.4576e9          # fallback only: the real rate is read from scope.fs (4.9152e9 on v4/v5)
-
 
 def _fit(t_s, y, f):
     """Sine fit at known f using the 3x3 normal equations (a few dot products: fast on the board's ARM)."""
@@ -24,7 +22,10 @@ def _fit(t_s, y, f):
     sn, cs = np.sin(w), np.cos(w)
     n = float(len(y))
     G = np.array([[sn @ sn, sn @ cs, sn.sum()], [sn @ cs, cs @ cs, cs.sum()], [sn.sum(), cs.sum(), n]])
-    a, b, c = np.linalg.solve(G, np.array([sn @ y, cs @ y, y.sum()]))
+    try:
+        a, b, c = np.linalg.solve(G, np.array([sn @ y, cs @ y, y.sum()]))
+    except np.linalg.LinAlgError:                 # f near 0 or fs/2, or too few samples: no fit
+        return float("nan"), float("inf")
     r = y - (a * sn + b * cs + c)
     return float(np.hypot(a, b)), float(np.sqrt(np.mean(r * r)))
 
@@ -54,12 +55,15 @@ def find_freq(t_s, y):
 
 
 class Bode:
-    def __init__(self, scope, gen_vpk=0.1, adc_vfs=None, threshold=0.005, channel=0,
+    def __init__(self, scope, gen_vpk=0.1, adc_vfs=None, threshold=0.005, channel="D",
                  length_ns=2000.0, averages=4, show=True):
         self.sc, self.gen_vpk, self.adc_vfs = scope, gen_vpk, adc_vfs
         self.threshold, self.channel, self.length_ns, self.averages = threshold, channel, length_ns, averages
+        from adc_scope import adc_letter
+        channel = adc_letter(channel)                    # "D" or "C"
         self.rows = []                                   # (f_hz, amp_fs, gain_db, resid_fs, ok)
-        self.fs = float(getattr(scope, "fs", ADC_FS))
+        self.trace = []                                  # (time_s, peak_fs) of the last scan()
+        self.fs = float(scope.fs)
         self.fig = self.ax = None
         if show:
             self._init_plot()
@@ -67,26 +71,31 @@ class Bode:
     def _acquire(self, length_ns):
         self.sc.configure(trigger="immediate", pre_ns=0, length_ns=length_ns)
         t, y = self.sc.acquire()
-        y = np.asarray(y, float)
-        if y.ndim > 1:
-            y = y[self.channel]
-        return np.asarray(t, float) * 1e-9, y
+        return np.asarray(t, float) * 1e-9, np.asarray(y[self.channel], float)
 
     def point(self, f=None):
-        t, y = self._acquire(self.length_ns)
+        if f is not None and not f > 0:
+            raise ValueError(f"f must be > 0 Hz, got {f}")
+        L = self.length_ns
+        t, y = self._acquire(L)
         if f is None:
             if np.ptp(y) < self.threshold:                  # nothing there: do not guess a frequency
                 self.rows.append((np.nan, np.ptp(y) / 2, np.nan, np.nan, False))
                 print(f"no signal (peak {np.ptp(y)/2:.4f} FS < threshold {self.threshold}): not plotted")
                 return None
             f = find_freq(t, y)
+            if not f > 0:
+                self.rows.append((np.nan, np.ptp(y) / 2, np.nan, np.nan, False))
+                print("could not find a frequency: not plotted")
+                return None
         cycles = f * (t[-1] - t[0])
         if cycles < 5:                                       # too few cycles: capture longer
-            t, y = self._acquire(min(6e9 / f, 5e4))
+            L = min(6e9 / f, self._max_length_ns())
+            t, y = self._acquire(L)
         amps, ress, clip = [], [], False
         for i in range(max(1, self.averages)):
             if i:
-                t, y = self._acquire(len(y) / self.fs * 1e9)
+                t, y = self._acquire(L)              # same window every time
             a, r = _fit(t, y, f)
             amps.append(a); ress.append(r)
             clip |= bool(np.max(np.abs(y)) > 0.95)
@@ -101,11 +110,7 @@ class Bode:
         return f, gain
 
     def _max_length_ns(self):
-        depth = getattr(self.sc, "depth", None)
-        spb = getattr(self.sc, "spb", None)
-        if depth and spb:
-            return 0.97 * depth * spb / self.fs * 1e9
-        return 38000.0
+        return 0.97 * self.sc.depth * self.sc.spb / self.fs * 1e9
 
     def scan(self, duration_s=20.0, max_points=400, fmax=None):
         """Generator in sweep mode: phase 1 only ACQUIRES (as fast as the scope allows, raw data kept in
@@ -143,7 +148,7 @@ class Bode:
               f"{1e3*t_acq/max(total,1):.0f} ms per acquire); {len(caps)} contain a signal "
               f"(largest peak {max([p for _, p in self.trace] or [0]):.4f} FS, channel {self.channel})")
         if not caps:
-            print("No signal: check the channel (channel=0/1), the generator output, or lower threshold=.")
+            print("No signal: check the channel (channel='D'/'C'), the generator output, or lower threshold=.")
             return
         idx = np.unique(np.linspace(0, len(caps) - 1, min(max_points, len(caps))).astype(int))
         t1, n_ok, high = time.time(), 0, 0
@@ -171,6 +176,8 @@ class Bode:
 
     def plot_trace(self):
         """Peak amplitude of every capture of the last scan() versus time: shows WHEN the signal is there."""
+        if not self.trace:
+            raise RuntimeError("nothing to plot: run scan() first")
         tr = np.array(self.trace)
         fig, ax = plt.subplots(figsize=(8, 3.5))
         ax.semilogy(tr[:, 0], np.maximum(tr[:, 1], 1e-5), ".", ms=3)

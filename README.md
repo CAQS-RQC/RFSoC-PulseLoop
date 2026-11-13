@@ -11,8 +11,8 @@ High-sampling-rate, high-memory-density, multi-channel arbitrary waveform genera
 
 - Data sampling at 9.8304 GSps
 - Two output channels: DAC B (DAC tile 0) and DAC A (DAC tile 2), see `CHANNELS` in `python/rfsoc_awg.py`
-- One looping waveform per DAC, up to $2^{18}$ samples (26.67 µs)
-  - The RAM has two halves per DAC, selected by (`axi_control` OR the `control_trigger` pin). The pin floats high on this board, so the Python driver always plays half "x" (`axi_control` = 1) and leaves "z" at zero.
+- Two looping waveforms per DAC, each up to $2^{18}$ samples (26.67 µs)
+  - Two slots per DAC, "x" and "z", selected by (`axi_control` OR the `control_trigger` pin). The Python driver writes `axi_control` = 0 so the pin decides: high or unconnected (it floats high) plays x, low plays z. `set_waveform(dac, w)` writes x, `set_waveform(dac, w, slot="z")` the other one; the dashboard only edits x.
 - Two-channel ADC capture (ADC D and ADC C) with triggers on each DAC's sequence start (`dac_b` locked, `dac_a` ±1 beat).
 - Sample loading within 5-7 ms.
 - One ADC input (ADC D) captured raw at the full 4.9152 GSps, with the ADC clock locked to the AWG, pre-trigger, and triggers from the ADC level, the AWG sequence start or the external trigger. See [ADC capture](#adc-capture).

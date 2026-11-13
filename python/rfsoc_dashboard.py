@@ -246,6 +246,7 @@ class AWGDashboard:
                                           "with the planned waveform")
         self.btn_align.on_click(lambda _: self._auto_align())
         self._last_capture = None               # (t_us, y) of the last ADC capture
+        self._last_unit = "FS"                  # unit of that capture: "V" (adc_vfs) or "FS"
         self.run.observe(self._on_run, names="value")
         self.autoplay = w.Checkbox(value=True, indent=False,
                                    description="Auto-play the AWG when the scope starts")
@@ -393,8 +394,8 @@ class AWGDashboard:
 
     # ------------------------------------------------------------------ drawing
     def _dac_volts(self, src):
-        """'DAC A' (or 'A') -> programmed volts of that DAC, or None."""
-        return self.awg._waves.get(src.split()[-1])
+        """'DAC A' (or 'A') -> programmed volts of that DAC's slot x, or None."""
+        return self.awg._waves.get((src.split()[-1], 1))
 
     def _out_xy(self):
         """(x, y) for each DAC, zoomed to the range slider and decimated."""
@@ -425,12 +426,18 @@ class AWGDashboard:
                                         row=2, col=1)
 
     def _update_overlay(self):
-        """Planned DAC waveform (orange, right axis) on top of the ADC trace.
+        """Planned DAC waveform (orange) on top of the ADC trace.
         The waveform loops forever, so it is repeated over the whole capture.  It is shifted by
-        the 'Delay' (DAC pipeline + converters + cable); use Auto-align to measure it."""
+        the 'Delay' (DAC pipeline + converters + cable); use Auto-align to measure it.
+        Scale: with adc_vfs the capture is in volts, so the plan goes on the same axis (true
+        volts). Without it the plan uses the right axis, with its zero on the capture's zero and
+        its peak on the capture's peak (shape comparison only)."""
         tr = self.fig_scope.data[2]
+        fig = self.fig_scope
         if self.source.value != "ADC capture" or self.overlay.value == "none":
-            tr.x, tr.y = [], []
+            with fig.batch_update():
+                tr.x, tr.y = [], []
+                fig.update_yaxes(autorange=True, secondary_y=False, row=1, col=1)
             return
         v = self._dac_volts(self.overlay.value)
         if v is None:
@@ -447,7 +454,31 @@ class AWGDashboard:
         xs = np.concatenate([t_one + k * win_us + delay_us for k in range(k0, k1)])
         ys = np.tile(v, k1 - k0)
         keep = (xs >= t_beg) & (xs <= t_end)
-        tr.x, tr.y = _decimate(xs[keep], ys[keep]) if keep.any() else ([], [])
+        x, yv = _decimate(xs[keep], ys[keep]) if keep.any() else ([], [])
+        with fig.batch_update():
+            tr.x, tr.y = x, yv
+            if self._last_unit == "V":                   # capture in volts: same axis, true scale
+                tr.yaxis = "y"
+                fig.update_yaxes(visible=False, secondary_y=True, row=1, col=1)
+                fig.update_yaxes(autorange=True, secondary_y=False, row=1, col=1)
+                return
+            tr.yaxis = "y2"
+            fig.update_yaxes(visible=True, secondary_y=True, row=1, col=1)
+            yc = self._last_capture[1] if self._last_capture else None
+            vpk = float(np.max(np.abs(ys[keep]))) if keep.any() else 0.0
+            ypk = float(np.max(np.abs(yc))) if yc is not None and len(yc) else 0.0
+            if vpk <= 0 or ypk <= 0:                     # nothing to match: plain +-0.3 V axis
+                fig.update_yaxes(autorange=True, secondary_y=False, row=1, col=1)
+                fig.update_yaxes(range=[-0.3, 0.3], title_text="planned DAC [V]",
+                                 secondary_y=True, row=1, col=1)
+                return
+            lo, hi = min(float(np.min(yc)), 0.0), max(float(np.max(yc)), 0.0)
+            pad = 0.05 * (hi - lo)
+            lo, hi = lo - pad, hi + pad
+            k = vpk / ypk                                # volts of plan per unit of capture
+            fig.update_yaxes(range=[lo, hi], autorange=False, secondary_y=False, row=1, col=1)
+            fig.update_yaxes(range=[lo * k, hi * k], autorange=False,
+                             title_text="planned DAC [V], peak-matched", secondary_y=True, row=1, col=1)
 
     def _auto_align(self):
         """Estimate the DAC->ADC delay: slide the (periodic) planned waveform over the last
@@ -598,7 +629,7 @@ class AWGDashboard:
         self.fig_scope.update_layout(title=f"Scope – ADC ({len(y)} samples @ {fs/1e9:.4f} GS/s"
                                            f"{', ' + note if note else ''})")
         self._show_scope(t_us, y, fs, unit)
-        self._last_capture = (t_us, y)
+        self._last_capture, self._last_unit = (t_us, y), unit
         self._update_overlay()
 
     def _scope_loop(self):
